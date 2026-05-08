@@ -6,12 +6,12 @@
   "author": "dora <dora@frees.jp>",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dora-frees/office-crypto.git"
+    "url": "git+https://github.com/doracpphp/office-crypto.git"
   },
   "bugs": {
-    "url": "https://github.com/dora-frees/office-crypto/issues"
+    "url": "https://github.com/doracpphp/office-crypto/issues"
   },
-  "homepage": "https://github.com/dora-frees/office-crypto#readme",
+  "homepage": "https://github.com/doracpphp/office-crypto#readme",
   "publishConfig": {
     "access": "public"
   },
