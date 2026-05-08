@@ -1,0 +1,71 @@
+{
+  "name": "office-crypto",
+  "version": "0.1.0",
+  "description": "Decrypt and encrypt password-protected MS Office files (DOCX/XLSX/PPTX, legacy XLS/DOC/PPT). TypeScript port of msoffcrypto-tool with zero runtime dependencies.",
+  "license": "MIT",
+  "author": "dora <dora@frees.jp>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dora-frees/office-crypto.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dora-frees/office-crypto/issues"
+  },
+  "homepage": "https://github.com/dora-frees/office-crypto#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./olefile": {
+      "types": "./dist/olefile.d.ts",
+      "import": "./dist/olefile.js",
+      "require": "./dist/olefile.cjs"
+    }
+  },
+  "bin": {
+    "office-crypto": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "msoffice",
+    "ooxml",
+    "docx",
+    "xlsx",
+    "pptx",
+    "encryption",
+    "decryption",
+    "office",
+    "ecma-376",
+    "cfb",
+    "ole"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^3.2.4"
+  }
+}
