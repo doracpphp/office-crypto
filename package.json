@@ -21,18 +21,28 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
     },
     "./olefile": {
-      "types": "./dist/olefile.d.ts",
-      "import": "./dist/olefile.js",
-      "require": "./dist/olefile.cjs"
+      "import": {
+        "types": "./dist/olefile.d.ts",
+        "default": "./dist/olefile.js"
+      },
+      "require": {
+        "types": "./dist/olefile.d.cts",
+        "default": "./dist/olefile.cjs"
+      }
     }
   },
   "bin": {
-    "office-crypto": "./dist/cli.js"
+    "office-crypto": "dist/cli.js"
   },
   "files": [
     "dist",
