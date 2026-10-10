@@ -19,7 +19,7 @@ import {
 } from "../crypto.js";
 import {
   bytesEqual,
-  concatBytes,
+  joinBytes,
   packU32LE,
   packU64LE,
   readU64LE,
@@ -111,6 +111,57 @@ function deriveEncryptionKey(
   return finalHash.subarray(0, keyBits / 8);
 }
 
+/** Decrypt the document secret key, given the spin-count hash chain result. */
+function makekeyFromIteratedHash(
+  h: Uint8Array,
+  saltValue: Uint8Array,
+  hashAlgorithm: HashAlgorithm,
+  encryptedKeyValue: Uint8Array,
+  keyBits: number,
+): Uint8Array {
+  const encryptionKey = deriveEncryptionKey(
+    h,
+    BLK_ENCRYPTED_KEY_VALUE,
+    hashAlgorithm,
+    keyBits,
+  );
+  return aesCbcDecrypt(encryptedKeyValue, encryptionKey, saltValue);
+}
+
+/** Check the password verifier, given the spin-count hash chain result. */
+function verifyIteratedHash(
+  h: Uint8Array,
+  saltValue: Uint8Array,
+  hashAlgorithm: HashAlgorithm,
+  encryptedVerifierHashInput: Uint8Array,
+  encryptedVerifierHashValue: Uint8Array,
+  keyBits: number,
+): boolean {
+  const key1 = deriveEncryptionKey(
+    h,
+    BLK_VERIFIER_HASH_INPUT,
+    hashAlgorithm,
+    keyBits,
+  );
+  const key2 = deriveEncryptionKey(
+    h,
+    BLK_ENCRYPTED_VERIFIER_HASH_VALUE,
+    hashAlgorithm,
+    keyBits,
+  );
+
+  const hashInput = aesCbcDecrypt(encryptedVerifierHashInput, key1, saltValue);
+  const actualHash = hash(hashAlgorithm, hashInput);
+  const expectedFull = aesCbcDecrypt(
+    encryptedVerifierHashValue,
+    key2,
+    saltValue,
+  );
+  const expected = expectedFull.subarray(0, hashSize(hashAlgorithm));
+
+  return bytesEqual(actualHash, expected);
+}
+
 export class ECMA376Agile {
   /**
    * Decrypt the EncryptedPackage stream using a derived secret key.
@@ -131,24 +182,26 @@ export class ECMA376Agile {
     const head = ibuf.read(8);
     const totalSize = Number(readU64LE(head, 0));
 
-    const out: Uint8Array[] = [];
+    // The plaintext can never be longer than the ciphertext, so cap the
+    // allocation in case the size header is garbage (e.g. wrong key).
+    const out = new Uint8Array(
+      Math.min(totalSize, Math.max(0, ibuf.length - 8)),
+    );
     let written = 0;
     let i = 0;
-    while (true) {
+    while (written < out.length) {
       const buf = ibuf.read(SEGMENT_LENGTH);
       if (buf.length === 0) break;
       // Avoid an extra allocation: `hash()` accepts multiple parts.
       const iv = hash(hashAlgorithm, keyDataSalt, packU32LE(i)).subarray(0, 16);
-      let dec = aesCbcDecrypt(buf, key, iv);
-      const remaining = totalSize - written;
-      if (remaining < dec.length) dec = dec.subarray(0, remaining);
-      out.push(dec);
-      written += dec.length;
-      if (written >= totalSize) break;
+      const dec = aesCbcDecrypt(buf, key, iv);
+      const n = Math.min(dec.length, out.length - written);
+      out.set(dec.subarray(0, n), written);
+      written += n;
       i++;
     }
 
-    return concatBytes(...out);
+    return out.subarray(0, written);
   }
 
   /**
@@ -185,7 +238,7 @@ export class ECMA376Agile {
       i++;
     }
 
-    return concatBytes(...segments);
+    return joinBytes(segments);
   }
 
   /**
@@ -207,30 +260,53 @@ export class ECMA376Agile {
       hashAlgorithm,
       spinValue,
     );
-
-    const key1 = deriveEncryptionKey(
+    return verifyIteratedHash(
       h,
-      BLK_VERIFIER_HASH_INPUT,
-      hashAlgorithm,
-      keyBits,
-    );
-    const key2 = deriveEncryptionKey(
-      h,
-      BLK_ENCRYPTED_VERIFIER_HASH_VALUE,
-      hashAlgorithm,
-      keyBits,
-    );
-
-    const hashInput = aesCbcDecrypt(encryptedVerifierHashInput, key1, saltValue);
-    const actualHash = hash(hashAlgorithm, hashInput);
-    const expectedFull = aesCbcDecrypt(
-      encryptedVerifierHashValue,
-      key2,
       saltValue,
+      hashAlgorithm,
+      encryptedVerifierHashInput,
+      encryptedVerifierHashValue,
+      keyBits,
     );
-    const expected = expectedFull.subarray(0, hashSize(hashAlgorithm));
+  }
 
-    return bytesEqual(actualHash, expected);
+  /**
+   * `makekeyFromPassword` + `verifyPassword` in one call, running the
+   * expensive spin-count hash chain once instead of twice.
+   */
+  static makekeyAndVerifyPassword(
+    password: string,
+    saltValue: Uint8Array,
+    hashAlgorithm: HashAlgorithm,
+    encryptedKeyValue: Uint8Array,
+    encryptedVerifierHashInput: Uint8Array,
+    encryptedVerifierHashValue: Uint8Array,
+    spinValue: number,
+    keyBits: number,
+  ): { secretKey: Uint8Array; verified: boolean } {
+    const h = deriveIteratedHashFromPassword(
+      password,
+      saltValue,
+      hashAlgorithm,
+      spinValue,
+    );
+    return {
+      secretKey: makekeyFromIteratedHash(
+        h,
+        saltValue,
+        hashAlgorithm,
+        encryptedKeyValue,
+        keyBits,
+      ),
+      verified: verifyIteratedHash(
+        h,
+        saltValue,
+        hashAlgorithm,
+        encryptedVerifierHashInput,
+        encryptedVerifierHashValue,
+        keyBits,
+      ),
+    };
   }
 
   /**
@@ -282,13 +358,13 @@ export class ECMA376Agile {
       hashAlgorithm,
       spinValue,
     );
-    const encryptionKey = deriveEncryptionKey(
+    return makekeyFromIteratedHash(
       h,
-      BLK_ENCRYPTED_KEY_VALUE,
+      saltValue,
       hashAlgorithm,
+      encryptedKeyValue,
       keyBits,
     );
-    return aesCbcDecrypt(encryptedKeyValue, encryptionKey, saltValue);
   }
 
   /**

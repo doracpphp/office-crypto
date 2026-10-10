@@ -45,6 +45,8 @@ file.loadKey({ privateKey: pemBytes });          // RSA-protected file
 file.loadKey({ secretKey: rawBytes });           // pre-derived intermediate key
 ```
 
+`decrypt()` returns a new buffer on every call and never modifies the input.
+
 ### HMAC integrity check (Agile only)
 
 ```ts
@@ -67,8 +69,8 @@ ole.openstream("EncryptionInfo").getValue();
 # decrypt (password visible in `ps` — fine for local one-offs only)
 npx office-crypto -p PASSWORD encrypted.docx plain.docx
 
-# safer: read password from stdin, or from a file
-echo -n "$PASSWORD" | npx office-crypto --password-stdin encrypted.docx plain.docx
+# safer: read password from stdin (first line), or from a file
+echo "$PASSWORD" | npx office-crypto --password-stdin encrypted.docx plain.docx
 npx office-crypto --password-file ~/.config/secret encrypted.docx plain.docx
 
 # interactive prompt (no echo) when no password flag is given
@@ -82,7 +84,7 @@ npx office-crypto -t encrypted.docx
 
 ```sh
 npm install
-npm test         # vitest against the original Python test fixtures
+npm test         # vitest; output must match msoffcrypto-tool byte for byte (see test/README.md)
 npm run build    # tsup → dist/
 ```
 

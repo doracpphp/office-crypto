@@ -4,7 +4,7 @@
  * Entry point. Exposes:
  *   - `OfficeFile(buf)`: factory that auto-detects file format.
  *   - `OOXMLFile`: handler for DOCX/XLSX/PPTX.
- *   - `Xls97File` / `Doc97File` / `Ppt97File`: legacy stubs.
+ *   - `Xls97File` / `Doc97File` / `Ppt97File`: legacy (97-2003) formats.
  *   - `isEncrypted(buf)`: quick helper.
  *
  * See README for usage and the documented public surface area.
@@ -31,6 +31,7 @@ export { Xls97File } from "./format/xls97.js";
 export { Doc97File } from "./format/doc97.js";
 export { Ppt97File } from "./format/ppt97.js";
 export { OleFileIO, isOleFile } from "./olefile.js";
+export { ECMA376Agile } from "./method/ecma376_agile.js";
 
 export type {
   BaseOfficeFile,
