@@ -283,7 +283,7 @@ export class Doc97File implements BaseOfficeFile {
   }
 
   decrypt(_opts: DecryptOptions = {}): Uint8Array {
-    if (!this.type || !this.password) {
+    if (!this.type || this.password === undefined) {
       throw new DecryptionError("Must call loadKey before decrypt");
     }
 
@@ -320,11 +320,15 @@ export class Doc97File implements BaseOfficeFile {
       dataDec = this.cipherDecrypt(dataBytes);
     }
 
-    this.ole.writeStream("WordDocument", newWordDoc);
-    this.ole.writeStream(this.tableName, tableDec);
-    if (dataDec) this.ole.writeStream("Data", dataDec);
+    // Write into a fresh copy of the container so `this.ole` keeps the
+    // encrypted streams (decrypt stays repeatable) and the returned buffer
+    // isn't shared with later calls.
+    const out = new OleFileIO(this.ole.getBuffer());
+    out.writeStream("WordDocument", newWordDoc);
+    out.writeStream(this.tableName, tableDec);
+    if (dataDec) out.writeStream("Data", dataDec);
 
-    return this.ole.getBuffer();
+    return out.getBuffer();
   }
 
   private cipherDecrypt(buf: Uint8Array): Uint8Array {

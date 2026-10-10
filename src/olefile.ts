@@ -112,7 +112,7 @@ export class OleStream {
   }
 
   read(size?: number): Uint8Array {
-    const remaining = this._buf.length - this._pos;
+    const remaining = Math.max(0, this._buf.length - this._pos);
     const n = size === undefined ? remaining : Math.min(size, remaining);
     const out = this._buf.subarray(this._pos, this._pos + n);
     this._pos += n;

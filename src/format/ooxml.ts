@@ -30,7 +30,7 @@ import type {
   DecryptOptions,
   LoadKeyOptions,
 } from "./base.js";
-import type { HashAlgorithm } from "../crypto.js";
+import { parseHashAlgorithm, type HashAlgorithm } from "../crypto.js";
 
 /**
  * Quick zip-magic sniff for plain OOXML detection. We don't decompress; we
@@ -56,14 +56,8 @@ export function isOoxml(buf: Uint8Array): boolean {
   return true;
 }
 
-/** EncryptionInfo with type discriminator. */
-type AgileInfo = {
-  type: "agile";
-  keyDataSalt: Uint8Array;
-  keyDataHashAlgorithm: HashAlgorithm;
-  keyDataBlockSize: number;
-  encryptedHmacKey: Uint8Array;
-  encryptedHmacValue: Uint8Array;
+/** Fields of the password key encryptor's `<p:encryptedKey>` element. */
+type PasswordKeyEncryptor = {
   encryptedVerifierHashInput: Uint8Array;
   encryptedVerifierHashValue: Uint8Array;
   encryptedKeyValue: Uint8Array;
@@ -71,6 +65,23 @@ type AgileInfo = {
   passwordSalt: Uint8Array;
   passwordHashAlgorithm: HashAlgorithm;
   passwordKeyBits: number;
+};
+
+/** EncryptionInfo with type discriminator. */
+type AgileInfo = {
+  type: "agile";
+  keyDataSalt: Uint8Array;
+  keyDataHashAlgorithm: HashAlgorithm;
+  keyDataBlockSize: number;
+  /** null when the descriptor has no `<dataIntegrity>` element. */
+  dataIntegrity: {
+    encryptedHmacKey: Uint8Array;
+    encryptedHmacValue: Uint8Array;
+  } | null;
+  /** null when the file can't be opened with a password. */
+  password: PasswordKeyEncryptor | null;
+  /** RSA-wrapped secret key from the certificate key encryptor, if any. */
+  certificateEncryptedKeyValue: Uint8Array | null;
 };
 
 type StandardInfo = {
@@ -81,78 +92,131 @@ type StandardInfo = {
 
 type ParsedInfo = AgileInfo | StandardInfo;
 
+const KEY_ENCRYPTOR_PASSWORD =
+  "http://schemas.microsoft.com/office/2006/keyEncryptor/password";
+const KEY_ENCRYPTOR_CERTIFICATE =
+  "http://schemas.microsoft.com/office/2006/keyEncryptor/certificate";
+
+/** [MS-OFFCRYPTO] caps spinCount at 10,000,000; reject anything larger. */
+const MAX_SPIN_COUNT = 10_000_000;
+
+/** Optional namespace prefix in front of an element name, e.g. `p:`. */
+const NS_PREFIX = "(?:[A-Za-z_][\\w.-]*:)?";
+
 /**
- * Pull a single attribute value out of an XML tag matching `tagPattern`.
- * Used because the Agile descriptor has a fixed schema — full XML parsing
- * would just inflate the dependency footprint.
+ * Return the first start tag of element `name` (with any namespace prefix)
+ * in `xml`, or null. The Agile descriptor has a fixed, shallow schema, so
+ * this is enough — full XML parsing would just inflate the dependency
+ * footprint.
  */
-function readAttr(
-  xml: string,
-  tagPattern: RegExp,
-  attr: string,
-): string {
-  const tagMatch = xml.match(tagPattern);
-  if (!tagMatch) throw new FileFormatError(`Tag not found: ${tagPattern}`);
-  const tag = tagMatch[0];
-  const re = new RegExp(`${attr}\\s*=\\s*"([^"]*)"`);
-  const m = tag.match(re);
+function findTag(xml: string, name: string): string | null {
+  const m = xml.match(new RegExp(`<${NS_PREFIX}${name}(?=[\\s/>])[^>]*>`));
+  return m ? m[0] : null;
+}
+
+function requireTag(xml: string, name: string): string {
+  const tag = findTag(xml, name);
+  if (!tag) throw new FileFormatError(`Element not found: ${name}`);
+  return tag;
+}
+
+/** Read attribute `attr` (single- or double-quoted) from a start tag. */
+function readAttr(tag: string, attr: string): string {
+  const m = tag.match(
+    new RegExp(`\\s${attr}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`),
+  );
   if (!m) throw new FileFormatError(`Attribute not found: ${attr}`);
-  return m[1];
+  return m[1] ?? m[2];
+}
+
+function readIntAttr(tag: string, attr: string): number {
+  const value = readAttr(tag, attr);
+  const n = Number(value);
+  if (!Number.isSafeInteger(n) || n < 0) {
+    throw new FileFormatError(`Invalid ${attr}: ${value}`);
+  }
+  return n;
+}
+
+function readHashAttr(tag: string, attr: string): HashAlgorithm {
+  const value = readAttr(tag, attr);
+  const algorithm = parseHashAlgorithm(value);
+  if (!algorithm) {
+    throw new DecryptionError(`Unsupported hash algorithm: ${value}`);
+  }
+  return algorithm;
+}
+
+/**
+ * Map each `<keyEncryptor uri="...">` to the `<encryptedKey>` start tag it
+ * contains. A file may carry several encryptors (password and certificate),
+ * in any order, so they must be told apart by `uri` rather than position.
+ */
+function findKeyEncryptors(xml: string): Map<string, string> {
+  const re = new RegExp(
+    `<${NS_PREFIX}keyEncryptor(?=[\\s>])[^>]*>([\\s\\S]*?)</${NS_PREFIX}keyEncryptor\\s*>`,
+    "g",
+  );
+  const out = new Map<string, string>();
+  for (const m of xml.matchAll(re)) {
+    const encryptedKey = findTag(m[1], "encryptedKey");
+    if (encryptedKey) out.set(readAttr(m[0], "uri"), encryptedKey);
+  }
+  return out;
 }
 
 function parseAgileInfo(xml: string): AgileInfo {
-  const keyDataSalt = base64Decode(readAttr(xml, /<keyData\s[^>]*\/?>/, "saltValue"));
-  const keyDataHashAlgorithm = readAttr(
-    xml,
-    /<keyData\s[^>]*\/?>/,
-    "hashAlgorithm",
-  ) as HashAlgorithm;
-  const keyDataBlockSize = parseInt(
-    readAttr(xml, /<keyData\s[^>]*\/?>/, "blockSize"),
-    10,
-  );
-  const encryptedHmacKey = base64Decode(
-    readAttr(xml, /<dataIntegrity\s[^>]*\/?>/, "encryptedHmacKey"),
-  );
-  const encryptedHmacValue = base64Decode(
-    readAttr(xml, /<dataIntegrity\s[^>]*\/?>/, "encryptedHmacValue"),
-  );
+  const keyData = requireTag(xml, "keyData");
+  const dataIntegrity = findTag(xml, "dataIntegrity");
+  const encryptors = findKeyEncryptors(xml);
+  const passwordTag = encryptors.get(KEY_ENCRYPTOR_PASSWORD);
+  const certificateTag = encryptors.get(KEY_ENCRYPTOR_CERTIFICATE);
+  if (!passwordTag && !certificateTag) {
+    throw new FileFormatError("No supported key encryptor found");
+  }
 
-  // Look for the password keyEncryptor's <p:encryptedKey> element. The
-  // namespace prefix may be "p:" or another prefix bound to the same URI.
-  const ekTagRe = /<(?:[A-Za-z0-9_-]+:)?encryptedKey\s[^>]*\/?>/;
-  const spinValue = parseInt(readAttr(xml, ekTagRe, "spinCount"), 10);
-  const encryptedKeyValue = base64Decode(
-    readAttr(xml, ekTagRe, "encryptedKeyValue"),
-  );
-  const encryptedVerifierHashInput = base64Decode(
-    readAttr(xml, ekTagRe, "encryptedVerifierHashInput"),
-  );
-  const encryptedVerifierHashValue = base64Decode(
-    readAttr(xml, ekTagRe, "encryptedVerifierHashValue"),
-  );
-  const passwordSalt = base64Decode(readAttr(xml, ekTagRe, "saltValue"));
-  const passwordHashAlgorithm = readAttr(
-    xml,
-    ekTagRe,
-    "hashAlgorithm",
-  ) as HashAlgorithm;
-  const passwordKeyBits = parseInt(readAttr(xml, ekTagRe, "keyBits"), 10);
+  let password: PasswordKeyEncryptor | null = null;
+  if (passwordTag) {
+    const spinValue = readIntAttr(passwordTag, "spinCount");
+    if (spinValue > MAX_SPIN_COUNT) {
+      throw new FileFormatError(`spinCount too large: ${spinValue}`);
+    }
+    password = {
+      encryptedVerifierHashInput: base64Decode(
+        readAttr(passwordTag, "encryptedVerifierHashInput"),
+      ),
+      encryptedVerifierHashValue: base64Decode(
+        readAttr(passwordTag, "encryptedVerifierHashValue"),
+      ),
+      encryptedKeyValue: base64Decode(
+        readAttr(passwordTag, "encryptedKeyValue"),
+      ),
+      spinValue,
+      passwordSalt: base64Decode(readAttr(passwordTag, "saltValue")),
+      passwordHashAlgorithm: readHashAttr(passwordTag, "hashAlgorithm"),
+      passwordKeyBits: readIntAttr(passwordTag, "keyBits"),
+    };
+  }
 
   return {
     type: "agile",
-    keyDataSalt,
-    keyDataHashAlgorithm,
-    keyDataBlockSize,
-    encryptedHmacKey,
-    encryptedHmacValue,
-    encryptedVerifierHashInput,
-    encryptedVerifierHashValue,
-    encryptedKeyValue,
-    spinValue,
-    passwordSalt,
-    passwordHashAlgorithm,
-    passwordKeyBits,
+    keyDataSalt: base64Decode(readAttr(keyData, "saltValue")),
+    keyDataHashAlgorithm: readHashAttr(keyData, "hashAlgorithm"),
+    keyDataBlockSize: readIntAttr(keyData, "blockSize"),
+    dataIntegrity: dataIntegrity
+      ? {
+          encryptedHmacKey: base64Decode(
+            readAttr(dataIntegrity, "encryptedHmacKey"),
+          ),
+          encryptedHmacValue: base64Decode(
+            readAttr(dataIntegrity, "encryptedHmacValue"),
+          ),
+        }
+      : null,
+    password,
+    certificateEncryptedKeyValue: certificateTag
+      ? base64Decode(readAttr(certificateTag, "encryptedKeyValue"))
+      : null,
   };
 }
 
@@ -231,32 +295,41 @@ export class OOXMLFile implements BaseOfficeFile {
 
   loadKey(opts: LoadKeyOptions): void {
     const { password, privateKey, secretKey, verifyPassword = false } = opts;
+    const info = this.info;
     if (password !== undefined) {
-      if (this.type === "agile") {
-        const info = this.info as AgileInfo;
-        this.secretKey = ECMA376Agile.makekeyFromPassword(
-          password,
-          info.passwordSalt,
-          info.passwordHashAlgorithm,
-          info.encryptedKeyValue,
-          info.spinValue,
-          info.passwordKeyBits,
-        );
-        if (verifyPassword) {
-          const ok = ECMA376Agile.verifyPassword(
-            password,
-            info.passwordSalt,
-            info.passwordHashAlgorithm,
-            info.encryptedVerifierHashInput,
-            info.encryptedVerifierHashValue,
-            info.spinValue,
-            info.passwordKeyBits,
+      if (info?.type === "agile") {
+        const pw = info.password;
+        if (!pw) {
+          throw new DecryptionError(
+            "This file has no password key encryptor; use a private key",
           );
-          if (!ok) throw new InvalidKeyError("Key verification failed");
         }
-      } else if (this.type === "standard") {
-        const info = this.info as StandardInfo;
-        this.secretKey = ECMA376Standard.makekeyFromPassword(
+        if (verifyPassword) {
+          const { secretKey: key, verified } =
+            ECMA376Agile.makekeyAndVerifyPassword(
+              password,
+              pw.passwordSalt,
+              pw.passwordHashAlgorithm,
+              pw.encryptedKeyValue,
+              pw.encryptedVerifierHashInput,
+              pw.encryptedVerifierHashValue,
+              pw.spinValue,
+              pw.passwordKeyBits,
+            );
+          if (!verified) throw new InvalidKeyError("Key verification failed");
+          this.secretKey = key;
+        } else {
+          this.secretKey = ECMA376Agile.makekeyFromPassword(
+            password,
+            pw.passwordSalt,
+            pw.passwordHashAlgorithm,
+            pw.encryptedKeyValue,
+            pw.spinValue,
+            pw.passwordKeyBits,
+          );
+        }
+      } else if (info?.type === "standard") {
+        const key = ECMA376Standard.makekeyFromPassword(
           password,
           info.header.algId,
           info.header.algIdHash,
@@ -267,25 +340,30 @@ export class OOXMLFile implements BaseOfficeFile {
         );
         if (verifyPassword) {
           const ok = ECMA376Standard.verifyKey(
-            this.secretKey,
+            key,
             info.verifier.encryptedVerifier,
             info.verifier.encryptedVerifierHash,
           );
           if (!ok) throw new InvalidKeyError("Key verification failed");
         }
-      } else if (this.type === "plain") {
-        // Nothing to do; the file is unencrypted.
+        this.secretKey = key;
+      } else {
+        // Plain file: nothing to do; the file is unencrypted.
       }
     } else if (privateKey !== undefined) {
-      if (this.type !== "agile") {
+      if (info?.type !== "agile") {
         throw new DecryptionError(
           "Unsupported key type for the encryption method",
         );
       }
-      const info = this.info as AgileInfo;
+      if (!info.certificateEncryptedKeyValue) {
+        throw new DecryptionError(
+          "This file has no certificate key encryptor; use a password",
+        );
+      }
       this.secretKey = ECMA376Agile.makekeyFromPrivkey(
         privateKey,
-        info.encryptedKeyValue,
+        info.certificateEncryptedKeyValue,
       );
     } else if (secretKey !== undefined) {
       this.secretKey = secretKey;
@@ -298,20 +376,27 @@ export class OOXMLFile implements BaseOfficeFile {
     if (this.type === "plain") {
       throw new DecryptionError("Document is not encrypted");
     }
+    const key = this.secretKey;
+    if (!key) throw new DecryptionError("Must call loadKey before decrypt");
     const ole = this.file as OleFileIO;
     const stream = ole.openstream("EncryptedPackage");
+    const info = this.info;
     let result: Uint8Array;
 
-    if (this.type === "agile") {
-      const info = this.info as AgileInfo;
+    if (info?.type === "agile") {
       if (opts.verifyIntegrity) {
+        if (!info.dataIntegrity) {
+          throw new DecryptionError(
+            "This file has no dataIntegrity element to verify",
+          );
+        }
         const ok = ECMA376Agile.verifyIntegrity(
-          this.secretKey!,
+          key,
           info.keyDataSalt,
           info.keyDataHashAlgorithm,
           info.keyDataBlockSize,
-          info.encryptedHmacKey,
-          info.encryptedHmacValue,
+          info.dataIntegrity.encryptedHmacKey,
+          info.dataIntegrity.encryptedHmacValue,
           stream.getValue(),
         );
         if (!ok) {
@@ -319,16 +404,13 @@ export class OOXMLFile implements BaseOfficeFile {
         }
       }
       result = ECMA376Agile.decrypt(
-        this.secretKey!,
+        key,
         info.keyDataSalt,
         info.keyDataHashAlgorithm,
         new BytesIO(stream.getValue()),
       );
-    } else if (this.type === "standard") {
-      result = ECMA376Standard.decrypt(
-        this.secretKey!,
-        new BytesIO(stream.getValue()),
-      );
+    } else if (info?.type === "standard") {
+      result = ECMA376Standard.decrypt(key, new BytesIO(stream.getValue()));
     } else {
       throw new DecryptionError("Unsupported encryption method");
     }

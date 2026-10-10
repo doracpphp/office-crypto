@@ -1,90 +1,65 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-import { OfficeFile, InvalidKeyError } from "../src/index.js";
+import { OfficeFile, DecryptionError, InvalidKeyError } from "../src/index.js";
+import { blockwiseRc4Decrypt } from "../src/method/rc4_common.js";
+import { rc4 } from "../src/crypto.js";
+import { BytesIO } from "../src/utils.js";
+import { PASSWORD, expected, input } from "./fixtures.js";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+// Every legacy case is compared byte for byte against msoffcrypto-tool's
+// output (see test/README.md).
+const cases = [
+  ["rc4cryptoapi_password.ppt", "ppt97", PASSWORD],
+  ["rc4cryptoapi_password.doc", "doc97", PASSWORD],
+  ["rc4cryptoapi_password.xls", "xls97", PASSWORD],
+  ["xor_password_123456789012345.xls", "xls97", "123456789012345"],
+] as const;
 
-const PYTHON_TESTS = join(__dirname, "../../msoffcrypto-tool/tests");
-const INPUTS = join(PYTHON_TESTS, "inputs");
-const OUTPUTS = join(PYTHON_TESTS, "outputs");
-
-const PASSWORD = "Password1234_";
-
-function load(p: string): Uint8Array {
-  const buf = readFileSync(p);
-  return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
-}
-
-describe("PPT97 decryption", () => {
-  it("decrypts rc4cryptoapi_password.ppt (RC4 CryptoAPI)", () => {
-    const input = load(join(INPUTS, "rc4cryptoapi_password.ppt"));
-    const file = OfficeFile(input);
-    expect(file.format).toBe("ppt97");
-    file.loadKey({ password: PASSWORD });
-    const out = file.decrypt();
-    expect(out.length).toBe(input.length);
-    expect(out.slice(0, 4)).toEqual(new Uint8Array([0xd0, 0xcf, 0x11, 0xe0]));
+describe.each(cases)("%s", (name, format, password) => {
+  it(`decrypts to the same bytes as msoffcrypto-tool (${format})`, () => {
+    const file = OfficeFile(input(name));
+    expect(file.format).toBe(format);
+    expect(file.isEncrypted()).toBe(true);
+    file.loadKey({ password });
+    expect(file.decrypt()).toEqual(expected(name));
   });
 
-  it("rejects an incorrect ppt password", () => {
-    const input = load(join(INPUTS, "rc4cryptoapi_password.ppt"));
-    const file = OfficeFile(input);
-    expect(() => file.loadKey({ password: "0000" })).toThrow(InvalidKeyError);
-  });
-});
-
-describe("DOC97 decryption", () => {
-  it("decrypts rc4cryptoapi_password.doc (RC4 CryptoAPI)", () => {
-    const input = load(join(INPUTS, "rc4cryptoapi_password.doc"));
-    const file = OfficeFile(input);
-    expect(file.format).toBe("doc97");
-    file.loadKey({ password: PASSWORD });
-    const out = file.decrypt();
-    // Compare against Python's actual output (saved separately) — the
-    // committed expected file in tests/outputs/ has been re-saved by Word.
-    expect(out.length).toBe(input.length);
-    expect(out.slice(0, 4)).toEqual(new Uint8Array([0xd0, 0xcf, 0x11, 0xe0]));
-  });
-
-  it("rejects an incorrect doc password", () => {
-    const input = load(join(INPUTS, "rc4cryptoapi_password.doc"));
-    const file = OfficeFile(input);
-    expect(() => file.loadKey({ password: "0000" })).toThrow(InvalidKeyError);
-  });
-});
-
-describe("XLS97 decryption", () => {
-  it("decrypts rc4cryptoapi_password.xls (RC4 CryptoAPI)", () => {
-    const input = load(join(INPUTS, "rc4cryptoapi_password.xls"));
-    const expected = load(join(OUTPUTS, "rc4cryptoapi_password_plain.xls"));
-    const file = OfficeFile(input);
-    expect(file.format).toBe("xls97");
-    file.loadKey({ password: PASSWORD });
-    const out = file.decrypt();
-    expect(out.length).toBe(expected.length);
-    expect(out).toEqual(expected);
-  });
-
-  it("decrypts xor_password_123456789012345.xls (XOR obfuscation)", () => {
-    // The committed expected file in tests/outputs/ was re-saved by Excel and
-    // is a different size from what either the Python tool or this port emits
-    // (both produce a same-size in-place patch). Verify the result is a valid
-    // OLE file with a Workbook stream that no longer contains a FilePass record.
-    const input = load(join(INPUTS, "xor_password_123456789012345.xls"));
-    const file = OfficeFile(input);
-    file.loadKey({ password: "123456789012345" });
-    const out = file.decrypt();
-    expect(out.length).toBe(input.length);
-    // Magic bytes survive
-    expect(out.slice(0, 4)).toEqual(new Uint8Array([0xd0, 0xcf, 0x11, 0xe0]));
+  it("returns an independent, identical buffer on every decrypt call", () => {
+    const file = OfficeFile(input(name));
+    file.loadKey({ password });
+    const first = file.decrypt();
+    const second = file.decrypt();
+    expect(second).not.toBe(first);
+    expect(second).toEqual(expected(name));
+    expect(first).toEqual(expected(name));
   });
 
   it("rejects an incorrect password", () => {
-    const input = load(join(INPUTS, "rc4cryptoapi_password.xls"));
-    const file = OfficeFile(input);
+    const file = OfficeFile(input(name));
     expect(() => file.loadKey({ password: "0000" })).toThrow(InvalidKeyError);
+  });
+});
+
+describe("unencrypted legacy files", () => {
+  it.each(["plain.xls", "plain.doc", "plain.ppt"])(
+    "%s: loadKey reports the file is not encrypted",
+    (name) => {
+      const file = OfficeFile(input(name));
+      expect(file.isEncrypted()).toBe(false);
+      expect(() => file.loadKey({ password: PASSWORD })).toThrow(
+        DecryptionError,
+      );
+    },
+  );
+});
+
+describe("blockwiseRc4Decrypt", () => {
+  it("handles more blocks than fit in a spread call", () => {
+    // Regression: concatenating per-block results with `...spread`
+    // overflowed the call stack at ~150k blocks (e.g. a ~75MB .doc).
+    const key = new Uint8Array([1, 2, 3, 4, 5]);
+    const data = new Uint8Array(300_000).fill(0xab);
+    const out = blockwiseRc4Decrypt(new BytesIO(data), () => key, 1);
+    expect(out.length).toBe(data.length);
+    expect(out[299_999]).toBe(rc4(key, data.subarray(0, 1))[0]);
   });
 });

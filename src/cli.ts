@@ -104,11 +104,15 @@ async function promptPassword(): Promise<string> {
   if (!process.stdin.isTTY) {
     // Non-TTY: read a single line without echo handling.
     const rl = readline.createInterface({ input: process.stdin });
-    return new Promise<string>((resolve) => {
+    return new Promise<string>((resolve, reject) => {
       rl.once("line", (line: string) => {
-        rl.close();
+        // Resolve before close(): close() emits "close" synchronously.
         resolve(line);
+        rl.close();
       });
+      // Without this, empty stdin leaves the promise pending and Node exits
+      // with status 0 without writing anything. (No-op after a line.)
+      rl.once("close", () => reject(new Error("No password provided")));
     });
   }
 
@@ -121,7 +125,8 @@ async function promptPassword(): Promise<string> {
     let pwd = "";
     const onData = (chunk: string) => {
       for (const ch of chunk) {
-        if (ch === "\r" || ch === "\n") {
+        // Enter, or Ctrl-D (EOF) which raw mode delivers as a character.
+        if (ch === "\r" || ch === "\n" || ch === "\x04") {
           process.stdin.setRawMode(false);
           process.stdin.pause();
           process.stdin.removeListener("data", onData);
@@ -147,25 +152,24 @@ async function promptPassword(): Promise<string> {
   });
 }
 
-/** Read a password from stdin (one line), without prompting. */
+/** First line of `s`, without its line terminator (LF or CRLF). */
+function firstLine(s: string): string {
+  const newline = s.indexOf("\n");
+  return (newline === -1 ? s : s.slice(0, newline)).replace(/\r$/, "");
+}
+
+/** Read a password from stdin (first line), without prompting. */
 async function readPasswordFromStdinPipe(): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) {
     chunks.push(chunk as Buffer);
   }
-  // Strip a single trailing newline (CR/LF).
-  let s = Buffer.concat(chunks).toString("utf8");
-  if (s.endsWith("\r\n")) s = s.slice(0, -2);
-  else if (s.endsWith("\n") || s.endsWith("\r")) s = s.slice(0, -1);
-  return s;
+  return firstLine(Buffer.concat(chunks).toString("utf8"));
 }
 
 async function resolvePassword(args: Args): Promise<string> {
   if (args.passwordFile) {
-    const raw = readFileSync(args.passwordFile, "utf8");
-    // Use only the first line; trim a trailing newline.
-    const newline = raw.indexOf("\n");
-    return (newline === -1 ? raw : raw.slice(0, newline)).replace(/\r$/, "");
+    return firstLine(readFileSync(args.passwordFile, "utf8"));
   }
   if (args.passwordStdin) return readPasswordFromStdinPipe();
   if (args.password !== undefined && args.password !== "") return args.password;
@@ -200,9 +204,14 @@ async function main(): Promise<void> {
     );
   }
 
-  const password = await resolvePassword(args);
-
+  // Detect the format first so unsupported or unencrypted files fail
+  // before the user is asked for a password.
   const file = OfficeFile(view);
+  if (!file.isEncrypted()) {
+    throw new Error(`${args.infile}: not encrypted`);
+  }
+
+  const password = await resolvePassword(args);
   file.loadKey({ password });
   const decrypted = file.decrypt();
 

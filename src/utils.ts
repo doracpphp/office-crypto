@@ -3,6 +3,14 @@
  */
 
 export function concatBytes(...parts: Uint8Array[]): Uint8Array {
+  return joinBytes(parts);
+}
+
+/**
+ * Array form of `concatBytes`. Use this when the number of parts grows with
+ * the input size — spreading ~100k+ arguments overflows the call stack.
+ */
+export function joinBytes(parts: readonly Uint8Array[]): Uint8Array {
   let total = 0;
   for (const p of parts) total += p.length;
   const out = new Uint8Array(total);
@@ -285,7 +293,7 @@ export class BytesIO {
   }
 
   read(size?: number): Uint8Array {
-    const remaining = this._buf.length - this._pos;
+    const remaining = Math.max(0, this._buf.length - this._pos);
     const n = size === undefined ? remaining : Math.min(size, remaining);
     const out = this._buf.subarray(this._pos, this._pos + n);
     this._pos += n;

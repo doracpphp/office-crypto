@@ -128,12 +128,13 @@ export class DocumentXOR {
   static decrypt(
     password: string,
     ibuf: BytesIO,
-    plaintext: number[],
+    plaintext: ArrayLike<number>,
     _records: unknown,
     _base: unknown,
   ): Uint8Array {
     const xorArray = DocumentXOR.createXorArrayMethod1(password);
-    const out: number[] = [];
+    const out = new Uint8Array(plaintext.length);
+    let outIndex = 0;
 
     let dataIndex = 0;
     while (dataIndex < plaintext.length) {
@@ -153,15 +154,15 @@ export class DocumentXOR {
           const dataByte = ibuf.read(1)[0];
           let tempRes = dataByte ^ xorArray[xorArrayIndex];
           tempRes = ror(tempRes, 5, 8);
-          out.push(tempRes);
+          out[outIndex++] = tempRes;
           xorArrayIndex = (xorArrayIndex + 1) % 16;
         }
       } else {
-        out.push(ibuf.read(1)[0]);
+        out[outIndex++] = ibuf.read(1)[0];
       }
       dataIndex += count;
     }
 
-    return new Uint8Array(out);
+    return out;
   }
 }

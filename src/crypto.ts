@@ -17,10 +17,30 @@ import {
   createDecipheriv,
   createPrivateKey,
   privateDecrypt,
+  randomFillSync,
   constants as cryptoConstants,
 } from "node:crypto";
 
 export type HashAlgorithm = "SHA1" | "SHA256" | "SHA384" | "SHA512" | "MD5";
+
+/**
+ * Validate a hash algorithm name read from a file (e.g. the Agile XML
+ * descriptor's `hashAlgorithm` attribute). Accepts both "SHA1" and the
+ * hyphenated "SHA-1" spelling. Returns null for unsupported algorithms.
+ */
+export function parseHashAlgorithm(name: string): HashAlgorithm | null {
+  const normalized = name.toUpperCase().replace(/-/g, "");
+  switch (normalized) {
+    case "SHA1":
+    case "SHA256":
+    case "SHA384":
+    case "SHA512":
+    case "MD5":
+      return normalized;
+    default:
+      return null;
+  }
+}
 
 function nodeAlgo(a: HashAlgorithm): string {
   switch (a) {
@@ -203,8 +223,6 @@ export function rsaDecryptPkcs1v15(
  * Cryptographically secure random bytes.
  */
 export function randomBytes(n: number): Uint8Array {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { randomFillSync } = require("node:crypto") as typeof import("node:crypto");
   const out = new Uint8Array(n);
   randomFillSync(out);
   return out;

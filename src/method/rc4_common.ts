@@ -6,7 +6,7 @@
  */
 
 import { hash, rc4, type HashAlgorithm } from "../crypto.js";
-import { bytesEqual, concatBytes } from "../utils.js";
+import { bytesEqual, concatBytes, joinBytes } from "../utils.js";
 import type { Readable } from "../format/common.js";
 
 /**
@@ -55,5 +55,5 @@ export function blockwiseRc4Decrypt(
     block += 1;
     key = makeKey(block);
   }
-  return concatBytes(...out);
+  return joinBytes(out);
 }

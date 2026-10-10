@@ -22,7 +22,7 @@ import { DocumentRC4 } from "../method/rc4.js";
 import { DocumentRC4CryptoAPI } from "../method/rc4_cryptoapi.js";
 import { DocumentXOR } from "../method/xor_obfuscation.js";
 import { parseHeaderRC4, parseHeaderRC4CryptoAPI } from "./common.js";
-import { BytesIO, packU16LE, readU16, readU16LE } from "../utils.js";
+import { BytesIO, readU16, readU16LE } from "../utils.js";
 import type {
   BaseOfficeFile,
   DecryptOptions,
@@ -86,16 +86,20 @@ class BIFFStream {
       this.data.read(h.size);
     }
   }
-
-  *iterRecord(): Generator<{ num: number; size: number; record: BytesIO }> {
-    while (true) {
-      const h = this.readHeader();
-      if (!h) break;
-      const record = new BytesIO(new Uint8Array(this.data.read(h.size)));
-      yield { num: h.num, size: h.size, record };
-    }
-  }
 }
+
+/**
+ * Records that MUST NOT be encrypted ([MS-XLS] 2.2.10) — preserved verbatim.
+ * FilePass is also on that list but gets zeroed out instead.
+ */
+const PLAIN_RECORDS: ReadonlySet<number> = new Set([
+  RECORD.BOF,
+  RECORD.UsrExcl,
+  RECORD.FileLock,
+  RECORD.InterfaceHdr,
+  RECORD.RRDInfo,
+  RECORD.RRDHead,
+]);
 
 type EncType = "rc4" | "rc4_cryptoapi" | "xor";
 
@@ -131,6 +135,9 @@ export class Xls97File implements BaseOfficeFile {
     const bofSize = readU16(wb.data);
     wb.data.read(bofSize);
 
+    if (!wb.hasRecord(RECORD.FilePass)) {
+      throw new DecryptionError("File is not encrypted");
+    }
     const filePass = wb.skipTo(RECORD.FilePass);
     const wEncryptionType = readU16(wb.data);
     const encryptionInfo = new BytesIO(
@@ -203,79 +210,58 @@ export class Xls97File implements BaseOfficeFile {
   }
 
   decrypt(_opts: DecryptOptions = {}): Uint8Array {
-    if (!this.type || !this.password) {
+    if (!this.type || this.password === undefined) {
       throw new DecryptionError("Must call loadKey before decrypt");
     }
 
     // Pass 1: classify each byte of the workbook into "preserve plain" or
-    // "decrypt". We accumulate a parallel "encrypted-only" buffer (zero-filled
-    // where plain bytes will land) so the cipher's per-block re-keying lines
-    // up with the actual stream offsets — both buffers share the same length.
-    const plain: number[] = []; // values >=0 land verbatim; -1 / -2 are decrypted
-    const encrypted: number[] = []; // bytes fed to the cipher (0 at plain spots)
+    // "decrypt". `plain` holds the output byte at plain positions and a
+    // marker (-1 / -2) where a decrypted byte goes; `encrypted` holds the
+    // bytes fed to the cipher (0 at plain spots). Both are indexed by stream
+    // offset so the cipher's per-block re-keying lines up.
+    const data = this.workbookData;
+    const plain = new Int16Array(data.length);
+    const encrypted = new Uint8Array(data.length);
 
-    const wb = new BIFFStream(new BytesIO(this.workbookData));
-    for (const { num, size, record } of wb.iterRecord()) {
-      const header = packU16LE(num);
-      const sizeHeader = packU16LE(size);
+    let pos = 0;
+    while (pos + 4 <= data.length) {
+      const num = readU16LE(data, pos);
+      const body = pos + 4;
+      // Clamp in case the last record claims more bytes than remain.
+      const end = Math.min(body + readU16LE(data, pos + 2), data.length);
+      // The 4-byte record header always stays plain.
+      plain.set(data.subarray(pos, body), pos);
+
       if (num === RECORD.FilePass) {
-        // Zero out the FilePass record so the output is no longer marked as
-        // encrypted. Header bytes [0, 0] then [size_lo, size_hi] preserves
-        // the record framing.
-        plain.push(0, 0, sizeHeader[0], sizeHeader[1]);
-        for (let i = 0; i < size; i++) plain.push(0);
-        for (let i = 0; i < 4 + size; i++) encrypted.push(0);
-        continue;
+        // Zero out the record id and body so the output is no longer marked
+        // as encrypted; keeping the size field preserves the record framing.
+        plain[pos] = 0;
+        plain[pos + 1] = 0;
+      } else if (PLAIN_RECORDS.has(num)) {
+        plain.set(data.subarray(body, end), body);
+      } else if (num === RECORD.BoundSheet8) {
+        // BoundSheet8.lbPlyPos (first 4 body bytes) MUST stay plain; the
+        // remainder is encrypted.
+        const lbEnd = Math.min(body + 4, end);
+        plain.set(data.subarray(body, lbEnd), body);
+        plain.fill(-2, lbEnd, end);
+        encrypted.set(data.subarray(lbEnd, end), lbEnd);
+      } else {
+        plain.fill(-1, body, end);
+        encrypted.set(data.subarray(body, end), body);
       }
-      if (
-        num === RECORD.BOF ||
-        num === RECORD.UsrExcl ||
-        num === RECORD.FileLock ||
-        num === RECORD.InterfaceHdr ||
-        num === RECORD.RRDInfo ||
-        num === RECORD.RRDHead
-      ) {
-        // Records that MUST NOT be encrypted — preserve verbatim.
-        plain.push(header[0], header[1], sizeHeader[0], sizeHeader[1]);
-        const rec = record.read();
-        for (const b of rec) plain.push(b);
-        for (let i = 0; i < 4 + size; i++) encrypted.push(0);
-        continue;
-      }
-      if (num === RECORD.BoundSheet8) {
-        // Per spec, BoundSheet8.lbPlyPos (first 4 bytes after header) must
-        // stay plain; the remainder is encrypted.
-        plain.push(header[0], header[1], sizeHeader[0], sizeHeader[1]);
-        const lbPlyPos = record.read(4);
-        for (const b of lbPlyPos) plain.push(b);
-        for (let i = 0; i < size - 4; i++) plain.push(-2);
-        for (let i = 0; i < 8; i++) encrypted.push(0);
-        const rest = record.read();
-        for (const b of rest) encrypted.push(b);
-        continue;
-      }
-      // Default: 4-byte header stays plain, body gets decrypted.
-      plain.push(header[0], header[1], sizeHeader[0], sizeHeader[1]);
-      for (let i = 0; i < size; i++) plain.push(-1);
-      for (let i = 0; i < 4; i++) encrypted.push(0);
-      const body = record.read();
-      for (const b of body) encrypted.push(b);
+      pos = end;
     }
-
-    if (plain.length !== encrypted.length) {
-      throw new DecryptionError(
-        "Internal error: plain/encrypted length mismatch",
-      );
-    }
+    // A trailing fragment too short for a record header is kept verbatim.
+    plain.set(data.subarray(pos), pos);
 
     // Pass 2: decrypt the parallel encrypted-only buffer.
-    const encryptedBuf = new Uint8Array(encrypted);
     let dec: Uint8Array;
     if (this.type === "rc4") {
       dec = DocumentRC4.decrypt(
         this.password,
         this.salt!,
-        new BytesIO(encryptedBuf),
+        new BytesIO(encrypted),
         1024,
       );
     } else if (this.type === "rc4_cryptoapi") {
@@ -283,7 +269,7 @@ export class Xls97File implements BaseOfficeFile {
         this.password,
         this.salt!,
         this.keySize!,
-        new BytesIO(encryptedBuf),
+        new BytesIO(encrypted),
         1024,
       );
     } else {
@@ -291,7 +277,7 @@ export class Xls97File implements BaseOfficeFile {
       // uses the marker array to know which bytes are real.
       dec = DocumentXOR.decrypt(
         this.password,
-        new BytesIO(encryptedBuf),
+        new BytesIO(encrypted),
         plain,
         null,
         10,
@@ -302,13 +288,15 @@ export class Xls97File implements BaseOfficeFile {
     const out = new Uint8Array(plain.length);
     for (let i = 0; i < plain.length; i++) {
       const c = plain[i];
-      out[i] = c === -1 || c === -2 ? dec[i] : c;
+      out[i] = c < 0 ? dec[i] : c;
     }
 
-    // Write the decrypted Workbook back into a copy of the OLE container,
-    // matching the Python implementation's behaviour.
-    this.ole.writeStream("Workbook", out);
-    return this.ole.getBuffer();
+    // Write the decrypted Workbook into a fresh copy of the OLE container,
+    // matching the Python implementation's behaviour and leaving `this.ole`
+    // untouched so decrypt stays repeatable.
+    const outOle = new OleFileIO(this.ole.getBuffer());
+    outOle.writeStream("Workbook", out);
+    return outOle.getBuffer();
   }
 
   isEncrypted(): boolean {

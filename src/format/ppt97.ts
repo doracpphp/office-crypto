@@ -269,18 +269,18 @@ function constructPersistObjectDirectory(
   const cu = parseCurrentUserAtom(currentUserBytes);
   const stack: PersistDirectoryAtom[] = [];
 
+  // Encrypted files should contain exactly one UserEditAtom, but walk the
+  // whole offsetLastEdit chain as [MS-PPT] 2.1.2 describes. Track visited
+  // offsets so a corrupt chain can't loop forever.
+  const visited = new Set<number>();
   let off = cu.offsetToCurrentEdit;
-  // Spec says exactly one UserEditAtom — but we walk the chain in case of
-  // multiple revisions, mirroring the Python implementation.
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
+  while (!visited.has(off)) {
+    visited.add(off);
     const ue = parseUserEditAtom(pptBytes, off);
     const pda = parsePersistDirectoryAtom(pptBytes, ue.offsetPersistDirectory);
     stack.push(pda);
     if (ue.offsetLastEdit === 0) break;
     off = ue.offsetLastEdit;
-    // Defensive break: real-world PPT has 1 entry
-    if (stack.length > 1) break;
   }
 
   const dir = new Map<number, number>();
@@ -438,51 +438,52 @@ export class Ppt97File implements BaseOfficeFile {
       this.currentUserBytes,
       this.pptBytes,
     );
-    // Convert to ordered array (Map preserves insertion order, matching the
-    // Python dict iteration semantics on Python 3.7+).
-    const items = Array.from(dir.entries());
+    const decryptRange = (persistId: number, start: number, end: number) =>
+      DocumentRC4CryptoAPI.decrypt(
+        this.password!,
+        this.salt!,
+        this.keySize!,
+        new BytesIO(this.pptBytes.subarray(start, end)),
+        // Each persist object is one RC4 stream keyed by its persistId, so
+        // use a block size that covers the whole range (no re-keying).
+        Math.max(1, end - start),
+        persistId,
+      );
 
-    for (let i = 0; i < items.length; i++) {
-      const [persistId, off] = items[i];
+    for (const [persistId, off] of dir) {
+      if (off + 8 > this.pptBytes.length) continue;
       const rh = parseRecordHeader(this.pptBytes, off);
 
-      // CryptSession10Container — zero out the entire record.
-      if (rh.recType === 0x2f14) {
-        const total = 8 + rh.recLen;
-        for (let k = 0; k < total; k++) dec[off + k] = 0;
+      // CryptSession10Container (stored unencrypted) — zero out the entire
+      // record. Matched by persistId rather than by recType, since the
+      // header bytes of an encrypted record could collide with 0x2F14.
+      if (persistId === ue.encryptSessionPersistIdRef) {
+        dec.fill(0, off, Math.min(off + 8 + rh.recLen, dec.length));
         continue;
       }
 
       // UserEditAtom / PersistDirectoryAtom — already handled above; skip.
       if (rh.recType === 0x0ff5 || rh.recType === 0x1772) continue;
 
-      // Compute the encrypted-region length: from this offset to the next
-      // persist object's offset, minus the 8-byte record header. The Python
-      // code has the same rule.
-      if (i + 1 >= items.length) continue;
-      const nextOff = items[i + 1][1];
-      const recLen = nextOff - off - 8;
-      if (recLen < 0) continue;
-
-      const encBuf = this.pptBytes.subarray(off, off + 8 + recLen);
-      // The Python source uses an "undocumented" blocksize that's a multiple
-      // of keySize big enough to cover (8 + recLen) plus one extra round.
-      const blockSize =
-        this.keySize! * (Math.floor((8 + recLen) / this.keySize!) + 1);
-      const decoded = DocumentRC4CryptoAPI.decrypt(
-        this.password!,
-        this.salt!,
-        this.keySize!,
-        new BytesIO(new Uint8Array(encBuf)),
-        blockSize,
-        persistId,
+      // The record header is encrypted along with the body, so decrypt it
+      // first to learn the record length. (The Python original instead
+      // assumes the next directory entry starts right after this record,
+      // which breaks when entries aren't in offset order and has no answer
+      // for the last entry.)
+      const header = parseRecordHeader(
+        decryptRange(persistId, off, off + 8),
+        0,
       );
-      dec.set(decoded.subarray(0, encBuf.length), off);
+      const end = Math.min(off + 8 + header.recLen, this.pptBytes.length);
+      dec.set(decryptRange(persistId, off, end), off);
     }
 
-    this.ole.writeStream("Current User", newCurrentUser);
-    this.ole.writeStream("PowerPoint Document", dec);
-    return this.ole.getBuffer();
+    // Write into a fresh copy of the container so `this.ole` is left
+    // untouched and the returned buffer isn't shared with later calls.
+    const out = new OleFileIO(this.ole.getBuffer());
+    out.writeStream("Current User", newCurrentUser);
+    out.writeStream("PowerPoint Document", dec);
+    return out.getBuffer();
   }
 
   isEncrypted(): boolean {
